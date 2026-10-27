@@ -19,6 +19,22 @@ import NetInfo from '@react-native-community/netinfo';
 
 const QUEUE_KEY = 'helpdesk_offline_ticket_queue';
 
+let queueMutex = Promise.resolve();
+
+/**
+ * Serialize queue operations so concurrent enqueueTicket and syncOfflineQueue
+ * calls never clobber each other's AsyncStorage reads and writes.
+ *
+ * @template T
+ * @param {() => Promise<T>} task
+ * @returns {Promise<T>}
+ */
+function withQueueLock(task) {
+  const next = queueMutex.then(task, task);
+  queueMutex = next.catch(() => {});
+  return next;
+}
+
 /**
  * Load the current queue from AsyncStorage.
  * @returns {Promise<Array>}
@@ -74,16 +90,18 @@ export async function enqueueTicket(supabaseClient, payload) {
     if (ok) return { queued: false, submitted: true };
   }
 
-  // Offline or submission failed — queue locally with metadata
-  const queue = await loadQueue();
-  queue.push({
-    id: `offline_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-    payload,
-    queuedAt: new Date().toISOString(),
-    retries: 0,
+  // Offline or submission failed — serialize queue read-modify-write
+  return withQueueLock(async () => {
+    const queue = await loadQueue();
+    queue.push({
+      id: `offline_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      payload,
+      queuedAt: new Date().toISOString(),
+      retries: 0,
+    });
+    await saveQueue(queue);
+    return { queued: true, submitted: false };
   });
-  await saveQueue(queue);
-  return { queued: true, submitted: false };
 }
 
 /**
@@ -97,23 +115,25 @@ export async function enqueueTicket(supabaseClient, payload) {
  * @returns {Promise<{ synced: number, failed: number }>}
  */
 export async function syncOfflineQueue(supabaseClient) {
-  const queue = await loadQueue();
-  if (queue.length === 0) return { synced: 0, failed: 0 };
+  return withQueueLock(async () => {
+    const queue = await loadQueue();
+    if (queue.length === 0) return { synced: 0, failed: 0 };
 
-  let synced = 0;
-  const remaining = [];
+    let synced = 0;
+    const remaining = [];
 
-  for (const item of queue) {
-    const ok = await submitTicket(supabaseClient, item.payload);
-    if (ok) {
-      synced++;
-    } else {
-      remaining.push({ ...item, retries: (item.retries || 0) + 1 });
+    for (const item of queue) {
+      const ok = await submitTicket(supabaseClient, item.payload);
+      if (ok) {
+        synced++;
+      } else {
+        remaining.push({ ...item, retries: (item.retries || 0) + 1 });
+      }
     }
-  }
 
-  await saveQueue(remaining);
-  return { synced, failed: remaining.length };
+    await saveQueue(remaining);
+    return { synced, failed: remaining.length };
+  });
 }
 
 /**
@@ -123,13 +143,17 @@ export async function syncOfflineQueue(supabaseClient) {
  * @returns {Promise<number>}
  */
 export async function getQueueCount() {
-  const queue = await loadQueue();
-  return queue.length;
+  return withQueueLock(async () => {
+    const queue = await loadQueue();
+    return queue.length;
+  });
 }
 
 /**
  * Clear the entire offline queue (e.g. on logout).
  */
 export async function clearOfflineQueue() {
-  await AsyncStorage.removeItem(QUEUE_KEY);
+  return withQueueLock(async () => {
+    await AsyncStorage.removeItem(QUEUE_KEY);
+  });
 }

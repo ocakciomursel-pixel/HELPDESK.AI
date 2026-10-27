@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   StyleSheet,
   View,
@@ -26,17 +26,121 @@ import * as Haptics from 'expo-haptics';
 export const DRAFT_STORAGE_KEY = 'helpdesk_ticket_draft';
 const CATEGORIES = ['General', 'Network', 'Software', 'Hardware', 'Access'];
 
+const clearDraftStorageSafely = async () => {
+  try {
+    await AsyncStorage.removeItem(DRAFT_STORAGE_KEY);
+  } catch {
+    // Ignore storage removal errors after a confirmed submission
+  }
+};
+
+const persistDraftSnapshotSafely = async ({ subject, description, category, image }) => {
+  const hasContent = Boolean(subject.trim() || description.trim() || image);
+  if (!hasContent) return;
+  const draftPayload = {
+    subject,
+    description,
+    category,
+    image,
+    imageUris: image ? [image] : [],
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    await AsyncStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draftPayload));
+  } catch {
+    // Ignore storage write error
+  }
+};
+
+/**
+ * Convert or upload a picked attachment URI into a durable reference that
+ * survives temporary picker file cleanup while queued offline.
+ */
+const resolveDurableAttachment = async (uri) => {
+  if (!uri) return { durableUri: null, base64: null };
+
+  let base64 = null;
+  let blob = null;
+  try {
+    if (typeof fetch === 'function') {
+      const response = await fetch(uri);
+      blob = await response.blob();
+      if (typeof FileReader !== 'undefined') {
+        base64 = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        });
+      }
+    }
+  } catch {
+    base64 = null;
+  }
+
+  try {
+    const storageBucket = supabase?.storage?.from?.('ticket-attachments');
+    if (storageBucket && blob) {
+      const fileName = `ticket_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`;
+      const { error: uploadError } = await storageBucket.upload(fileName, blob, {
+        contentType: 'image/jpeg',
+        upsert: false,
+      });
+      if (!uploadError) {
+        const { data } = storageBucket.getPublicUrl(fileName);
+        if (data?.publicUrl) {
+          return { durableUri: data.publicUrl, base64 };
+        }
+      }
+    }
+  } catch {
+    // Fall back to durable data URI or original URI when offline or bucket is unavailable
+  }
+
+  return {
+    durableUri: base64 || uri,
+    base64,
+  };
+};
+
 const CreateTicketScreen = () => {
-  const [subject, setSubject] = useState('');
-  const [description, setDescription] = useState('');
-  const [category, setCategory] = useState('General');
+  const [subject, setSubjectState] = useState('');
+  const [description, setDescriptionState] = useState('');
+  const [category, setCategoryState] = useState('General');
   const [loading, setLoading] = useState(false);
-  const [image, setImage] = useState(null);
+  const [image, setImageState] = useState(null);
   const [savedDraft, setSavedDraft] = useState(null);
   const [isOffline, setIsOffline] = useState(false);
   const [queueCount, setQueueCount] = useState(0);
   const [syncingQueue, setSyncingQueue] = useState(false);
   const [draftLoaded, setDraftLoaded] = useState(false);
+
+  const latestFormRef = useRef({
+    subject: '',
+    description: '',
+    category: 'General',
+    image: null,
+  });
+
+  const setSubject = useCallback((val) => {
+    latestFormRef.current = { ...latestFormRef.current, subject: val };
+    setSubjectState(val);
+  }, []);
+
+  const setDescription = useCallback((val) => {
+    latestFormRef.current = { ...latestFormRef.current, description: val };
+    setDescriptionState(val);
+  }, []);
+
+  const setCategory = useCallback((val) => {
+    latestFormRef.current = { ...latestFormRef.current, category: val };
+    setCategoryState(val);
+  }, []);
+
+  const setImage = useCallback((val) => {
+    latestFormRef.current = { ...latestFormRef.current, image: val };
+    setImageState(val);
+  }, []);
 
   const navigation = useNavigation();
   const { success, error: notifyError } = useNotification();
@@ -105,24 +209,7 @@ const CreateTicketScreen = () => {
   // Persist form inputs to AsyncStorage on change
   useEffect(() => {
     if (!draftLoaded) return;
-    const persistDraft = async () => {
-      const hasContent = Boolean(subject.trim() || description.trim() || image);
-      if (!hasContent) return;
-      const draftPayload = {
-        subject,
-        description,
-        category,
-        image,
-        imageUris: image ? [image] : [],
-        updatedAt: new Date().toISOString(),
-      };
-      try {
-        await AsyncStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draftPayload));
-      } catch {
-        // Ignore storage write error
-      }
-    };
-    persistDraft();
+    persistDraftSnapshotSafely({ subject, description, category, image });
   }, [subject, description, category, image, draftLoaded]);
 
   const handleRestoreDraft = () => {
@@ -141,10 +228,14 @@ const CreateTicketScreen = () => {
 
   const handleDiscardDraft = async () => {
     setSavedDraft(null);
-    try {
-      await AsyncStorage.removeItem(DRAFT_STORAGE_KEY);
-    } catch {
-      // Ignore storage error
+    const current = latestFormRef.current;
+    const hasCurrentEdits = Boolean(
+      current.subject.trim() || current.description.trim() || current.image
+    );
+    if (hasCurrentEdits) {
+      await persistDraftSnapshotSafely(current);
+    } else {
+      await clearDraftStorageSafely();
     }
   };
 
@@ -180,50 +271,60 @@ const CreateTicketScreen = () => {
       return;
     }
 
+    const submittedSnapshot = {
+      subject,
+      description,
+      category,
+      image,
+    };
+
     setLoading(true);
     try {
-      let base64 = null;
-      if (image) {
-        try {
-          const response = await fetch(image);
-          const blob = await response.blob();
-          base64 = await new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result);
-            reader.readAsDataURL(blob);
-          });
-        } catch {
-          base64 = null;
-        }
-      }
+      const { durableUri, base64 } = await resolveDurableAttachment(submittedSnapshot.image);
 
       const ticketPayload = {
-        subject: subject.trim() || description.trim().slice(0, 80),
-        description: description.trim(),
-        category,
-        image_uri: image || null,
+        subject:
+          submittedSnapshot.subject.trim() || submittedSnapshot.description.trim().slice(0, 80),
+        description: submittedSnapshot.description.trim(),
+        category: submittedSnapshot.category,
+        image_uri: durableUri,
       };
 
       const { submitted, queued } = await enqueueTicket(supabase, ticketPayload);
       await refreshQueueCount();
 
+      const current = latestFormRef.current;
+      const formUnchanged =
+        current.subject === submittedSnapshot.subject &&
+        current.description === submittedSnapshot.description &&
+        current.category === submittedSnapshot.category &&
+        current.image === submittedSnapshot.image;
+
       if (submitted) {
-        await AsyncStorage.removeItem(DRAFT_STORAGE_KEY);
+        if (formUnchanged) {
+          await clearDraftStorageSafely();
+        } else {
+          await persistDraftSnapshotSafely(current);
+        }
         setSavedDraft(null);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         navigation.navigate('AIProcessing', {
           subject: ticketPayload.subject,
-          category,
-          text: description,
+          category: submittedSnapshot.category,
+          text: submittedSnapshot.description,
           image_base64: base64,
           image_text: '',
         });
       } else if (queued) {
-        await AsyncStorage.removeItem(DRAFT_STORAGE_KEY);
         setSavedDraft(null);
-        setSubject('');
-        setDescription('');
-        setImage(null);
+        if (formUnchanged) {
+          await clearDraftStorageSafely();
+          setSubject('');
+          setDescription('');
+          setImage(null);
+        } else {
+          await persistDraftSnapshotSafely(current);
+        }
         success?.(
           'Saved to Offline Queue',
           'You are offline. Your ticket has been queued and will sync automatically when online.'
@@ -318,6 +419,7 @@ const CreateTicketScreen = () => {
               placeholderTextColor={COLORS.textMuted}
               value={subject}
               onChangeText={setSubject}
+              editable={!loading}
             />
 
             <Text style={[styles.inputLabel, { marginTop: 12, marginBottom: 8 }]}>Category</Text>
@@ -327,6 +429,7 @@ const CreateTicketScreen = () => {
                   key={cat}
                   style={[styles.categoryChip, category === cat && styles.categoryChipActive]}
                   onPress={() => setCategory(cat)}
+                  disabled={loading}
                 >
                   <Text
                     style={[
@@ -354,6 +457,7 @@ const CreateTicketScreen = () => {
               onChangeText={setDescription}
               numberOfLines={8}
               textAlignVertical="top"
+              editable={!loading}
             />
 
             {image && (
@@ -366,7 +470,7 @@ const CreateTicketScreen = () => {
             )}
 
             <View style={styles.actionRow}>
-              <TouchableOpacity style={styles.attachmentBtn} onPress={pickImage}>
+              <TouchableOpacity style={styles.attachmentBtn} onPress={pickImage} disabled={loading}>
                 <ImageIcon size={20} color={COLORS.primary} />
                 <Text style={styles.attachmentText}>{image ? 'Change Screenshot' : 'Attach Screenshot'}</Text>
               </TouchableOpacity>

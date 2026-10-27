@@ -45,6 +45,9 @@ jest.mock(
 jest.mock('../../../lib/supabase', () => ({
   supabase: {
     from: jest.fn(),
+    storage: {
+      from: jest.fn(),
+    },
   },
 }));
 
@@ -91,6 +94,7 @@ jest.mock('lucide-react-native', () => {
 import { supabase } from '../../../lib/supabase';
 import { useNavigation } from '@react-navigation/native';
 import { useNotification } from '../../../components/NotificationProvider';
+import { enqueueTicket, syncOfflineQueue } from '../../../utils/offlineQueue';
 import CreateTicketScreen, { DRAFT_STORAGE_KEY } from '../CreateTicketScreen';
 
 const flushPromises = () => new Promise((resolve) => setImmediate(resolve));
@@ -174,10 +178,57 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
     expect(inputs.some((i) => i.props.value === 'Restored draft description')).toBe(true);
   });
 
-  test('clears draft only after successful online API submission', async () => {
+  test('preserves current form edits when discarding a previously loaded draft', async () => {
+    AsyncStorage.getItem.mockImplementation(async (key) => {
+      if (key === DRAFT_STORAGE_KEY) {
+        return JSON.stringify({
+          subject: 'Old Draft',
+          description: 'Old description',
+          category: 'General',
+        });
+      }
+      return null;
+    });
+
+    let tree;
+    await act(async () => {
+      tree = renderer.create(<CreateTicketScreen />);
+      await flushPromises();
+    });
+
+    const descInput = tree.root
+      .findAllByType('TextInput')
+      .find((node) => node.props.placeholder === "Describe what's wrong in detail...");
+
+    await act(async () => {
+      descInput.props.onChangeText('Fresh edits before discarding old draft');
+      await flushPromises();
+    });
+
+    AsyncStorage.removeItem.mockClear();
+    AsyncStorage.setItem.mockClear();
+
+    const discardBtn = tree.root.find(
+      (node) => node.props && node.props.testID === 'discard-draft-button'
+    );
+
+    await act(async () => {
+      await discardBtn.props.onPress();
+      await flushPromises();
+    });
+
+    expect(AsyncStorage.removeItem).not.toHaveBeenCalled();
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith(
+      DRAFT_STORAGE_KEY,
+      expect.stringContaining('Fresh edits before discarding old draft')
+    );
+  });
+
+  test('clears draft only after successful online API submission and survives removeItem errors', async () => {
     supabase.from.mockReturnValue({
       insert: jest.fn().mockResolvedValue({ error: null }),
     });
+    AsyncStorage.removeItem.mockRejectedValueOnce(new Error('Storage cleanup failed'));
 
     let tree;
     await act(async () => {
@@ -206,6 +257,7 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
     });
 
     expect(AsyncStorage.removeItem).toHaveBeenCalledWith(DRAFT_STORAGE_KEY);
+    expect(mockError).not.toHaveBeenCalled();
     expect(mockNavigate).toHaveBeenCalledWith(
       'AIProcessing',
       expect.objectContaining({ text: 'Printer jammed on 3rd floor' })
@@ -232,5 +284,42 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
     expect(indicator).toBeTruthy();
     const texts = indicator.findAllByType('Text').map((t) => t.props.children);
     expect(texts).toContain('1 queued ticket(s) waiting to sync');
+  });
+
+  test('serializes syncOfflineQueue and enqueueTicket so new offline items are not overwritten', async () => {
+    let storedQueue = JSON.stringify([
+      { id: 'existing_1', payload: { description: 'First queued' }, retries: 0 },
+    ]);
+    AsyncStorage.getItem.mockImplementation(async (key) => {
+      if (key === 'helpdesk_offline_ticket_queue') return storedQueue;
+      return null;
+    });
+    AsyncStorage.setItem.mockImplementation(async (key, val) => {
+      if (key === 'helpdesk_offline_ticket_queue') storedQueue = val;
+    });
+
+    let resolveFirstInsert;
+    const mockInsert = jest.fn().mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirstInsert = () => resolve({ error: null });
+        })
+    );
+    supabase.from.mockReturnValue({ insert: mockInsert });
+    NetInfo.fetch.mockResolvedValue({ isConnected: false, isInternetReachable: false });
+
+    const syncPromise = syncOfflineQueue(supabase);
+    const enqueuePromise = enqueueTicket(supabase, { description: 'Second queued while syncing' });
+
+    await flushPromises();
+    resolveFirstInsert();
+
+    const [syncResult, enqueueResult] = await Promise.all([syncPromise, enqueuePromise]);
+    expect(syncResult).toEqual({ synced: 1, failed: 0 });
+    expect(enqueueResult).toEqual({ queued: true, submitted: false });
+
+    const finalQueue = JSON.parse(storedQueue);
+    expect(finalQueue).toHaveLength(1);
+    expect(finalQueue[0].payload.description).toBe('Second queued while syncing');
   });
 });
