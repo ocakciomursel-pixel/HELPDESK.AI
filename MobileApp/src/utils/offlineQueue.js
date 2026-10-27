@@ -16,6 +16,8 @@
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import * as FileSystem from 'expo-file-system/legacy';
+import { decode } from 'base64-arraybuffer';
 
 const QUEUE_KEY = 'helpdesk_offline_ticket_queue';
 
@@ -40,12 +42,10 @@ function withQueueLock(task) {
  * @returns {Promise<Array>}
  */
 async function loadQueue() {
-  try {
-    const raw = await AsyncStorage.getItem(QUEUE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  const queue = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(queue)) throw new Error('Stored offline queue is invalid');
+  return queue;
 }
 
 /**
@@ -63,11 +63,44 @@ async function saveQueue(queue) {
  * @returns {Promise<boolean>} true on success, false on failure.
  */
 async function submitTicket(supabaseClient, payload) {
+  let bucket;
+  let uploadedPath;
   try {
-    const { error } = await supabaseClient.from('tickets').insert(payload);
-    return !error;
+    const { data, error: sessionError } = await supabaseClient.auth.getSession();
+    if (sessionError || !payload.user_id || data?.session?.user?.id !== payload.user_id) return false;
+    let row = payload;
+    if (payload.image_uri && !/^https?:\/\//.test(payload.image_uri)) {
+      // Only file references enter AsyncStorage; conversion happens during upload.
+      const encoded = await FileSystem.readAsStringAsync(payload.image_uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      bucket = supabaseClient.storage.from('ticket-attachments');
+      const path = payload.user_id + '/ticket_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.jpg';
+      const { error: uploadError } = await bucket.upload(path, decode(encoded), {
+        contentType: 'image/jpeg', upsert: false,
+      });
+      if (uploadError) return false;
+      uploadedPath = path;
+      const { data: urlData } = bucket.getPublicUrl(path);
+      if (!urlData?.publicUrl) throw new Error('Attachment URL unavailable');
+      row = { ...payload, image_uri: urlData.publicUrl };
+    }
+    const { error } = await supabaseClient.from('tickets').insert(row);
+    if (error) throw error;
+    return true;
   } catch {
+    // A failed insert or upload cannot leave an orphan when a queue write fails too.
+    if (uploadedPath) {
+      try { await bucket.remove([uploadedPath]); } catch { /* best-effort remote cleanup */ }
+    }
     return false;
+  }
+}
+
+async function deleteSubmittedAttachment(payload) {
+  const directory = FileSystem.documentDirectory && FileSystem.documentDirectory + 'ticket-attachments/';
+  if (directory && payload.image_uri?.startsWith(directory)) {
+    try { await FileSystem.deleteAsync(payload.image_uri, { idempotent: true }); } catch { /* retry cleanup later */ }
   }
 }
 
@@ -87,7 +120,10 @@ export async function enqueueTicket(supabaseClient, payload) {
 
   if (isOnline) {
     const ok = await submitTicket(supabaseClient, payload);
-    if (ok) return { queued: false, submitted: true };
+    if (ok) {
+      await deleteSubmittedAttachment(payload);
+      return { queued: false, submitted: true };
+    }
   }
 
   // Offline or submission failed — serialize queue read-modify-write
@@ -121,17 +157,20 @@ export async function syncOfflineQueue(supabaseClient) {
 
     let synced = 0;
     const remaining = [];
+    const submittedPayloads = [];
 
     for (const item of queue) {
       const ok = await submitTicket(supabaseClient, item.payload);
       if (ok) {
         synced++;
+        submittedPayloads.push(item.payload);
       } else {
         remaining.push({ ...item, retries: (item.retries || 0) + 1 });
       }
     }
 
     await saveQueue(remaining);
+    await Promise.all(submittedPayloads.map(deleteSubmittedAttachment));
     return { synced, failed: remaining.length };
   });
 }

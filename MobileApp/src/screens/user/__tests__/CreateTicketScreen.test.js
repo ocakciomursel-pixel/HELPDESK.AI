@@ -44,12 +44,22 @@ jest.mock(
 
 jest.mock('../../../lib/supabase', () => ({
   supabase: {
+    auth: { getSession: jest.fn() },
     from: jest.fn(),
     storage: {
       from: jest.fn(),
     },
   },
 }));
+
+jest.mock('expo-file-system/legacy', () => ({
+  documentDirectory: 'file:///documents/',
+  EncodingType: { Base64: 'base64' },
+  makeDirectoryAsync: jest.fn().mockResolvedValue(undefined),
+  copyAsync: jest.fn().mockResolvedValue(undefined),
+  readAsStringAsync: jest.fn().mockResolvedValue('aGk='),
+  deleteAsync: jest.fn().mockResolvedValue(undefined),
+}), { virtual: true });
 
 jest.mock('@react-navigation/native', () => ({
   useNavigation: jest.fn(),
@@ -107,6 +117,7 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    supabase.auth.getSession.mockResolvedValue({ data: { session: { user: { id: 'user-1' } } }, error: null });
     useNavigation.mockReturnValue({ navigate: mockNavigate, goBack: mockGoBack });
     useNotification.mockReturnValue({ success: mockSuccess, error: mockError });
     AsyncStorage.getItem.mockResolvedValue(null);
@@ -258,6 +269,7 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
 
     expect(AsyncStorage.removeItem).toHaveBeenCalledWith(DRAFT_STORAGE_KEY);
     expect(mockError).not.toHaveBeenCalled();
+    expect(supabase.from().insert).toHaveBeenCalledWith(expect.objectContaining({ user_id: 'user-1' }));
     expect(mockNavigate).toHaveBeenCalledWith(
       'AIProcessing',
       expect.objectContaining({ text: 'Printer jammed on 3rd floor' })
@@ -288,7 +300,7 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
 
   test('serializes syncOfflineQueue and enqueueTicket so new offline items are not overwritten', async () => {
     let storedQueue = JSON.stringify([
-      { id: 'existing_1', payload: { description: 'First queued' }, retries: 0 },
+      { id: 'existing_1', payload: { description: 'First queued', user_id: 'user-1' }, retries: 0 },
     ]);
     AsyncStorage.getItem.mockImplementation(async (key) => {
       if (key === 'helpdesk_offline_ticket_queue') return storedQueue;
@@ -322,4 +334,62 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
     expect(finalQueue).toHaveLength(1);
     expect(finalQueue[0].payload.description).toBe('Second queued while syncing');
   });
+  test('clears a stored draft after the user deliberately empties the form', async () => {
+    let tree;
+    await act(async () => { tree = renderer.create(<CreateTicketScreen />); await flushPromises(); });
+    const input = tree.root.findAllByType('TextInput').find(n => n.props.placeholder === "Describe what's wrong in detail...");
+    await act(async () => { input.props.onChangeText('Temporary text'); await flushPromises(); });
+    AsyncStorage.removeItem.mockClear();
+    await act(async () => { input.props.onChangeText(''); await flushPromises(); });
+    expect(AsyncStorage.removeItem).toHaveBeenCalledWith(DRAFT_STORAGE_KEY);
+  });
+
+  test('does not overwrite queued tickets when reading storage fails', async () => {
+    NetInfo.fetch.mockResolvedValue({ isConnected: false });
+    AsyncStorage.getItem.mockRejectedValueOnce(new Error('Storage read failed'));
+    await expect(enqueueTicket(supabase, { user_id: 'user-1', description: 'New ticket' })).rejects.toThrow('Storage read failed');
+    expect(AsyncStorage.setItem).not.toHaveBeenCalled();
+  });
+
+  test('retains tickets belonging to another signed-in user without submitting them', async () => {
+    AsyncStorage.getItem.mockResolvedValue(JSON.stringify([{ id: 'other', payload: { user_id: 'other-user' } }]));
+    const result = await syncOfflineQueue(supabase);
+    expect(result).toEqual({ synced: 0, failed: 1 });
+    expect(supabase.from).not.toHaveBeenCalled();
+  });
+
+  test('removes an uploaded attachment when insert and queue persistence both fail', async () => {
+    const remove = jest.fn().mockResolvedValue({ error: null });
+    supabase.storage.from.mockReturnValue({
+      upload: jest.fn().mockResolvedValue({ error: null }),
+      getPublicUrl: jest.fn().mockReturnValue({ data: { publicUrl: 'https://example.com/image.jpg' } }),
+      remove,
+    });
+    supabase.from.mockReturnValue({ insert: jest.fn().mockResolvedValue({ error: new Error('Insert rejected') }) });
+    AsyncStorage.setItem.mockRejectedValueOnce(new Error('Queue full'));
+    await expect(enqueueTicket(supabase, { user_id: 'user-1', image_uri: 'file:///documents/ticket-attachments/image.jpg' })).rejects.toThrow('Queue full');
+    expect(remove).toHaveBeenCalledWith([expect.stringContaining('user-1/ticket_')]);
+  });
+
+  test('queues an app-owned file URI without storing image contents', async () => {
+    const picker = require('expo-image-picker');
+    const fileSystem = require('expo-file-system/legacy');
+    picker.launchImageLibraryAsync.mockResolvedValue({ canceled: false, assets: [{ uri: 'file:///temporary/photo.jpg' }] });
+    NetInfo.fetch.mockResolvedValue({ isConnected: false });
+    let tree;
+    await act(async () => { tree = renderer.create(<CreateTicketScreen />); await flushPromises(); });
+    const input = tree.root.findAllByType('TextInput').find(n => n.props.placeholder === "Describe what's wrong in detail...");
+    await act(async () => { input.props.onChangeText('Offline photo ticket'); await flushPromises(); });
+    const attachment = tree.root.findAllByType('TouchableOpacity').find(n => n.findAllByType('Text').some(t => t.props.children === 'Attach Screenshot'));
+    await act(async () => { await attachment.props.onPress(); await flushPromises(); });
+    const submit = tree.root.findAllByType('TouchableOpacity').find(n => n.findAllByType('Text').some(t => t.props.children === 'Analyze & Submit'));
+    await act(async () => { await submit.props.onPress(); await flushPromises(); });
+    expect(fileSystem.copyAsync).toHaveBeenCalledWith({ from: 'file:///temporary/photo.jpg', to: expect.stringContaining('file:///documents/ticket-attachments/') });
+    const queued = AsyncStorage.setItem.mock.calls.find(([key]) => key === 'helpdesk_offline_ticket_queue');
+    expect(queued).toBeDefined();
+    expect(queued[1]).toContain('file:///documents/ticket-attachments/');
+    expect(queued[1]).not.toContain('data:image');
+    expect(fileSystem.readAsStringAsync).not.toHaveBeenCalled();
+  });
+
 });

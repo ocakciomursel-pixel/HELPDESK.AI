@@ -22,6 +22,7 @@ import { useNotification } from '../../components/NotificationProvider';
 import { enqueueTicket, syncOfflineQueue, getQueueCount } from '../../utils/offlineQueue';
 import * as ImagePicker from 'expo-image-picker';
 import * as Haptics from 'expo-haptics';
+import * as FileSystem from 'expo-file-system/legacy';
 
 export const DRAFT_STORAGE_KEY = 'helpdesk_ticket_draft';
 const CATEGORIES = ['General', 'Network', 'Software', 'Hardware', 'Access'];
@@ -36,7 +37,10 @@ const clearDraftStorageSafely = async () => {
 
 const persistDraftSnapshotSafely = async ({ subject, description, category, image }) => {
   const hasContent = Boolean(subject.trim() || description.trim() || image);
-  if (!hasContent) return;
+  if (!hasContent) {
+    await clearDraftStorageSafely();
+    return;
+  }
   const draftPayload = {
     subject,
     description,
@@ -57,50 +61,15 @@ const persistDraftSnapshotSafely = async ({ subject, description, category, imag
  * survives temporary picker file cleanup while queued offline.
  */
 const resolveDurableAttachment = async (uri) => {
-  if (!uri) return { durableUri: null, base64: null };
-
-  let base64 = null;
-  let blob = null;
-  try {
-    if (typeof fetch === 'function') {
-      const response = await fetch(uri);
-      blob = await response.blob();
-      if (typeof FileReader !== 'undefined') {
-        base64 = await new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.onerror = () => resolve(null);
-          reader.readAsDataURL(blob);
-        });
-      }
-    }
-  } catch {
-    base64 = null;
-  }
-
-  try {
-    const storageBucket = supabase?.storage?.from?.('ticket-attachments');
-    if (storageBucket && blob) {
-      const fileName = `ticket_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`;
-      const { error: uploadError } = await storageBucket.upload(fileName, blob, {
-        contentType: 'image/jpeg',
-        upsert: false,
-      });
-      if (!uploadError) {
-        const { data } = storageBucket.getPublicUrl(fileName);
-        if (data?.publicUrl) {
-          return { durableUri: data.publicUrl, base64 };
-        }
-      }
-    }
-  } catch {
-    // Fall back to durable data URI or original URI when offline or bucket is unavailable
-  }
-
-  return {
-    durableUri: base64 || uri,
-    base64,
-  };
+  if (!uri) return null;
+  if (/^https?:\/\//.test(uri)) return uri;
+  if (!FileSystem.documentDirectory) throw new Error('Attachment storage unavailable');
+  const directory = FileSystem.documentDirectory + 'ticket-attachments/';
+  if (uri.startsWith(directory)) return uri;
+  await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+  const target = directory + 'ticket_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.jpg';
+  await FileSystem.copyAsync({ from: uri, to: target });
+  return target;
 };
 
 const CreateTicketScreen = () => {
@@ -208,9 +177,9 @@ const CreateTicketScreen = () => {
 
   // Persist form inputs to AsyncStorage on change
   useEffect(() => {
-    if (!draftLoaded) return;
+    if (!draftLoaded || savedDraft) return;
     persistDraftSnapshotSafely({ subject, description, category, image });
-  }, [subject, description, category, image, draftLoaded]);
+  }, [subject, description, category, image, draftLoaded, savedDraft]);
 
   const handleRestoreDraft = () => {
     if (!savedDraft) return;
@@ -261,7 +230,11 @@ const CreateTicketScreen = () => {
     });
 
     if (!result.canceled) {
-      setImage(result.assets[0].uri);
+      try {
+        setImage(await resolveDurableAttachment(result.assets[0].uri));
+      } catch (error) {
+        notifyError('Attachment Error', error.message);
+      }
     }
   };
 
@@ -280,9 +253,14 @@ const CreateTicketScreen = () => {
 
     setLoading(true);
     try {
-      const { durableUri, base64 } = await resolveDurableAttachment(submittedSnapshot.image);
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData?.session?.user?.id) {
+        throw new Error('Please sign in before submitting a ticket.');
+      }
+      const durableUri = await resolveDurableAttachment(submittedSnapshot.image);
 
       const ticketPayload = {
+        user_id: sessionData.session.user.id,
         subject:
           submittedSnapshot.subject.trim() || submittedSnapshot.description.trim().slice(0, 80),
         description: submittedSnapshot.description.trim(),
@@ -312,7 +290,7 @@ const CreateTicketScreen = () => {
           subject: ticketPayload.subject,
           category: submittedSnapshot.category,
           text: submittedSnapshot.description,
-          image_base64: base64,
+          image_base64: null,
           image_text: '',
         });
       } else if (queued) {
