@@ -115,8 +115,12 @@ const CreateTicketScreen = () => {
   const { success, error: notifyError } = useNotification();
 
   const refreshQueueCount = useCallback(async () => {
-    const count = await getQueueCount();
-    setQueueCount(count);
+    try {
+      const count = await getQueueCount();
+      setQueueCount(count);
+    } catch {
+      // A badge refresh cannot invalidate a confirmed submission.
+    }
   }, []);
 
   // Load saved draft and initial queue state on mount
@@ -216,6 +220,8 @@ const CreateTicketScreen = () => {
       if (synced > 0) {
         success?.('Offline Queue Synced', `${synced} queued ticket(s) submitted.`);
       }
+    } catch (error) {
+      notifyError('Offline Queue Error', error.message);
     } finally {
       setSyncingQueue(false);
     }
@@ -281,6 +287,9 @@ const CreateTicketScreen = () => {
       if (submitted) {
         if (formUnchanged) {
           await clearDraftStorageSafely();
+          setSubject('');
+          setDescription('');
+          setImage(null);
         } else {
           await persistDraftSnapshotSafely(current);
         }

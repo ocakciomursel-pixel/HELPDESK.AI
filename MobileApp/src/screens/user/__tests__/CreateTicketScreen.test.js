@@ -392,4 +392,23 @@ describe('CreateTicketScreen offline draft storage and queue sync', () => {
     expect(fileSystem.readAsStringAsync).not.toHaveBeenCalled();
   });
 
+  test('queue count read errors cannot invalidate a confirmed online submission', async () => {
+    const insert = jest.fn().mockResolvedValue({ error: null });
+    supabase.from.mockReturnValue({ insert });
+    AsyncStorage.getItem.mockImplementation(async key => {
+      if (key === 'helpdesk_offline_ticket_queue') throw new Error('Corrupt queue');
+      return null;
+    });
+    let tree;
+    await act(async () => { tree = renderer.create(<CreateTicketScreen />); await flushPromises(); });
+    const input = tree.root.findAllByType('TextInput').find(n => n.props.placeholder === "Describe what's wrong in detail...");
+    await act(async () => { input.props.onChangeText('Confirmed ticket'); await flushPromises(); });
+    const submit = tree.root.findAllByType('TouchableOpacity').find(n => n.findAllByType('Text').some(t => t.props.children === 'Analyze & Submit'));
+    await act(async () => { await submit.props.onPress(); await flushPromises(); });
+    expect(insert).toHaveBeenCalledTimes(1);
+    expect(mockNavigate).toHaveBeenCalledWith('AIProcessing', expect.objectContaining({ text: 'Confirmed ticket' }));
+    expect(mockError).not.toHaveBeenCalled();
+    expect(tree.root.findAllByType('TextInput').find(n => n.props.placeholder === "Describe what's wrong in detail...").props.value).toBe('');
+  });
+
 });
