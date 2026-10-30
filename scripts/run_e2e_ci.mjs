@@ -38,7 +38,7 @@ function killChildTree(entry) {
   if (!proc || proc.killed || proc.exitCode !== null) return;
   try {
     if (process.platform === "win32") {
-      spawnSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], {
+      spawnSync("C:\\Windows\\System32\\taskkill.exe", ["/PID", String(proc.pid), "/T", "/F"], {
         stdio: "ignore",
       });
     } else {

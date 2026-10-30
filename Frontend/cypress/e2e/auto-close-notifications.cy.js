@@ -57,8 +57,9 @@ describe('Auto-Close — Admin Settings Integration', () => {
       if ($btn.hasClass('bg-indigo-600')) {
         cy.wrap($btn).scrollIntoView().click({ force: true });
       }
-      getAutoResolveBtn().should('have.class', 'bg-slate-200');
     });
+
+    getAutoResolveBtn().should('have.class', 'bg-slate-200');
   });
 });
 

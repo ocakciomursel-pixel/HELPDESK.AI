@@ -13,10 +13,12 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { URL } from 'node:url';
 
 const PORT = Number(process.env.MOCK_SUPABASE_PORT || 54321);
 const HOST = process.env.MOCK_SUPABASE_HOST || '127.0.0.1';
+const JWT_HMAC_KEY = crypto.randomBytes(32);
 
 const DEFAULT_COMPANY_ID = 'comp-ritesh-001';
 const DEFAULT_COMPANY_NAME = 'RITESH PVT LTD';
@@ -48,7 +50,7 @@ function createJwt(user, expiresAtSec) {
     })
   );
   const sig = base64UrlEncode(
-    crypto.createHmac('sha256', 'e2e-local-jwt-secret').update(`${header}.${payload}`).digest()
+    crypto.createHmac('sha256', JWT_HMAC_KEY).update(`${header}.${payload}`).digest()
   );
   return `${header}.${payload}.${sig}`;
 }
@@ -249,19 +251,37 @@ function createSessionForUser(user) {
 }
 
 // ─── HTTP Helpers ────────────────────────────────────────────────────────────
+const ALLOWED_CORS_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:4173',
+  'http://localhost:8000',
+  'http://127.0.0.1:8000',
+];
+
+const ALLOWED_CORS_HEADERS =
+  'authorization, apikey, content-type, accept, accept-profile, content-profile, prefer, range, x-client-info, x-supabase-api-version, x-upsert, cache-control, pragma';
+
+function resolveAllowedOrigin(originHeader) {
+  for (const allowed of ALLOWED_CORS_ORIGINS) {
+    if (allowed === originHeader) {
+      return allowed;
+    }
+  }
+  return 'http://localhost:5173';
+}
+
 function setCorsHeaders(req, res) {
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
+  const safeOrigin = resolveAllowedOrigin(req.headers.origin);
+  res.setHeader('Access-Control-Allow-Origin', safeOrigin);
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader(
     'Access-Control-Allow-Methods',
     'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS'
   );
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    req.headers['access-control-request-headers'] ||
-      'authorization, apikey, content-type, accept, prefer, range, x-client-info, x-supabase-api-version'
-  );
+  res.setHeader('Access-Control-Allow-Headers', ALLOWED_CORS_HEADERS);
   res.setHeader(
     'Access-Control-Expose-Headers',
     'Content-Range, Range, X-Total-Count'
@@ -865,135 +885,62 @@ async function handleTestControl(req, res, url) {
   return sendJson(res, 404, { error: 'Unknown test endpoint' });
 }
 
-// ─── Minimal RFC 6455 WebSocket Handler for Phoenix Realtime ─────────────────
-function encodeWsTextFrame(text) {
-  const payload = Buffer.from(text, 'utf8');
-  const len = payload.length;
-  let header;
-  if (len < 126) {
-    header = Buffer.alloc(2);
-    header[0] = 0x81;
-    header[1] = len;
-  } else if (len < 65536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(len, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x81;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(len), 2);
-  }
-  return Buffer.concat([header, payload]);
-}
-
+// ─── Phoenix Realtime WebSocket Handler ──────────────────────────────────────
 function attachRealtimeWebSocket(server) {
-  server.on('upgrade', (req, socket) => {
-    const key = req.headers['sec-websocket-key'];
-    if (!key) {
-      socket.destroy();
-      return;
-    }
+  const frontendRequire = createRequire(
+    new URL('../Frontend/package.json', import.meta.url)
+  );
+  const { WebSocketServer } = frontendRequire('ws');
+  const wss = new WebSocketServer({ server });
 
-    const accept = crypto
-      .createHash('sha1')
-      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-      .digest('base64');
-
-    socket.write(
-      [
-        'HTTP/1.1 101 Switching Protocols',
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        `Sec-WebSocket-Accept: ${accept}`,
-        '\r\n',
-      ].join('\r\n')
-    );
-
-    let buffer = Buffer.alloc(0);
-
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      while (buffer.length >= 2) {
-        const opcode = buffer[0] & 0x0f;
-        const isMasked = (buffer[1] & 0x80) !== 0;
-        let payloadLen = buffer[1] & 0x7f;
-        let offset = 2;
-
-        if (payloadLen === 126) {
-          if (buffer.length < 4) return;
-          payloadLen = buffer.readUInt16BE(2);
-          offset = 4;
-        } else if (payloadLen === 127) {
-          if (buffer.length < 10) return;
-          payloadLen = Number(buffer.readBigUInt64BE(2));
-          offset = 10;
-        }
-
-        const maskBytes = isMasked ? 4 : 0;
-        if (buffer.length < offset + maskBytes + payloadLen) return;
-
-        const payload = Buffer.from(
-          buffer.subarray(offset + maskBytes, offset + maskBytes + payloadLen)
-        );
-        if (isMasked) {
-          const mask = buffer.subarray(offset, offset + 4);
-          for (let i = 0; i < payload.length; i += 1) {
-            payload[i] ^= mask[i % 4];
+  wss.on('connection', (ws) => {
+    ws.on('message', (data) => {
+      const msgText = Buffer.isBuffer(data)
+        ? data.toString('utf8')
+        : String(data);
+      try {
+        const parsed = JSON.parse(msgText);
+        if (Array.isArray(parsed)) {
+          // Phoenix v2 serializer: [join_ref, ref, topic, event, payload]
+          const [joinRef, ref, topic, event] = parsed;
+          if (
+            event === 'phx_join' ||
+            event === 'heartbeat' ||
+            event === 'access_token'
+          ) {
+            const reply = JSON.stringify([
+              joinRef,
+              ref,
+              topic,
+              'phx_reply',
+              { status: 'ok', response: { postgres_changes: [] } },
+            ]);
+            ws.send(reply);
+          }
+        } else if (parsed && typeof parsed === 'object') {
+          // Phoenix v1 serializer: { topic, event, payload, ref, join_ref }
+          const { topic, event, ref, join_ref: joinRef } = parsed;
+          if (
+            event === 'phx_join' ||
+            event === 'heartbeat' ||
+            event === 'access_token'
+          ) {
+            const reply = JSON.stringify({
+              topic,
+              event: 'phx_reply',
+              payload: { status: 'ok', response: { postgres_changes: [] } },
+              ref,
+              join_ref: joinRef,
+            });
+            ws.send(reply);
           }
         }
-        buffer = buffer.subarray(offset + maskBytes + payloadLen);
-
-        if (opcode === 0x8) {
-          socket.end();
-          return;
-        }
-        if (opcode === 0x9) {
-          // Ping -> Pong
-          const pong = Buffer.from([0x8a, 0x00]);
-          socket.write(pong);
-          continue;
-        }
-        if (opcode === 0x1) {
-          const msgText = payload.toString('utf8');
-          try {
-            const parsed = JSON.parse(msgText);
-            if (Array.isArray(parsed)) {
-              // Phoenix v2 serializer: [join_ref, ref, topic, event, payload]
-              const [joinRef, ref, topic, event] = parsed;
-              if (event === 'phx_join' || event === 'heartbeat' || event === 'access_token') {
-                const reply = JSON.stringify([
-                  joinRef,
-                  ref,
-                  topic,
-                  'phx_reply',
-                  { status: 'ok', response: { postgres_changes: [] } },
-                ]);
-                socket.write(encodeWsTextFrame(reply));
-              }
-            } else if (parsed && typeof parsed === 'object') {
-              // Phoenix v1 serializer: { topic, event, payload, ref, join_ref }
-              const { topic, event, ref, join_ref: joinRef } = parsed;
-              if (event === 'phx_join' || event === 'heartbeat' || event === 'access_token') {
-                const reply = JSON.stringify({
-                  topic,
-                  event: 'phx_reply',
-                  payload: { status: 'ok', response: { postgres_changes: [] } },
-                  ref,
-                  join_ref: joinRef,
-                });
-                socket.write(encodeWsTextFrame(reply));
-              }
-            }
-          } catch {
-            // Ignore malformed WS payloads
-          }
-        }
+      } catch {
+        // Ignore malformed WS payloads
       }
     });
 
-    socket.on('error', () => {});
+    ws.on('error', () => {});
   });
 }
 
